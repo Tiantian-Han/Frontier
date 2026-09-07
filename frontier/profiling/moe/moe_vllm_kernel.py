@@ -42,8 +42,49 @@ try:
     VLLM_API_VERSION = "0.10.x"
     VLLM_AVAILABLE = True
     print(f"vLLM {VLLM_VERSION} loaded successfully (API: {VLLM_API_VERSION})")
+except ImportError as e:
+    # vLLM >= 0.27: fused_moe_kernel became a Triton jit kernel invoked via
+    # torch.ops; the clean runtime-equivalent entry is fused_experts().
+    try:
+        import vllm
+        VLLM_VERSION = vllm.__version__
 
-    # Try to import FP8 quantization utilities
+        from vllm.model_executor.layers.fused_moe.fused_moe import (
+            fused_experts,
+            try_get_optimal_moe_config,
+        )
+        from vllm.model_executor.layers.fused_moe.config import (
+            _get_config_dtype_str as get_config_dtype_str,
+        )
+        from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+            moe_align_block_size,
+        )
+
+        fused_moe_kernel = None
+        invoke_fused_moe_kernel = None
+        VLLM_API_VERSION = "0.27.x"
+        VLLM_AVAILABLE = True
+        print(
+            f"vLLM {VLLM_VERSION} loaded successfully (API: {VLLM_API_VERSION}, "
+            "fused_experts path)"
+        )
+    except ImportError as e2:
+        print(f"vLLM import error: {e2}")
+        VLLM_AVAILABLE = False
+        VLLM_API_VERSION = None
+        fused_moe_kernel = None
+        invoke_fused_moe_kernel = None
+        fused_experts = None
+        try_get_optimal_moe_config = None
+        get_config_dtype_str = None
+        moe_align_block_size = None
+        print(
+            "Warning: vLLM >= 0.10.0 required. "
+            "Load imbalance profiling will not work."
+        )
+
+# FP8 quantization utilities (optional for both API versions).
+if VLLM_AVAILABLE:
     try:
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
             per_token_group_quant_fp8,
@@ -57,13 +98,6 @@ try:
         FP8_QUANT_AVAILABLE = False
         _per_block_cast_to_fp8 = None
         print("Warning: FP8 quantization utilities not available")
-
-except ImportError as e:
-    print(f"vLLM import error: {e}")
-    VLLM_AVAILABLE = False
-    VLLM_API_VERSION = None
-    _per_block_cast_to_fp8 = None
-    print("Warning: vLLM >= 0.10.0 required. Load imbalance profiling will not work.")
 
 
 def check_vllm_available():
@@ -516,6 +550,37 @@ def profile_fused_moe_kernel(
         M=num_tokens,
         block_shape=block_shape,
     )
+
+    if fused_experts is not None and not use_fp8:
+        # vLLM >= 0.27 runtime-equivalent path: the same fused_experts()
+        # entry the TritonExperts MoE backend calls in production serving.
+        def _step_experts() -> None:
+            fused_experts(
+                hidden_states=A,
+                w1=w1,
+                w2=w2,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                global_num_experts=align_num_experts,
+                expert_map=expert_map,
+            )
+
+        for _ in range(warmup_steps):
+            _step_experts()
+        torch.cuda.synchronize()
+
+        if profile_method == "record_function":
+            return _collect_record_function_stats(
+                step_fn=_step_experts,
+                active_steps=active_steps,
+                output_dir=output_dir,
+                operation_name="moe_grouped_gemm",
+            )
+
+        return _collect_cuda_event_stats(
+            step_fn=_step_experts,
+            active_steps=active_steps,
+        )
 
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_ids,

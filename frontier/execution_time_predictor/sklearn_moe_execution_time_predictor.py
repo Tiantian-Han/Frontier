@@ -2308,11 +2308,18 @@ class SklearnMoEExecutionTimePredictor(SklearnExecutionTimePredictor):
             moe_gating_routing_topk_time = 0.0
             moe_shuffling_time = 0.0
             moe_grouped_gemm_time = 0.0
-            if self._model_config.supports_share_expert():
+            if self._model_config.supports_share_expert() and not (
+                str(
+                    getattr(self._model_config, "model_type", "") or ""
+                ).lower()
+                in {"deepseek_v2", "deepseek_v3", "deepseek_mtp"}
+            ):
                 # Step2Mini/Step3 dense layers are the shared-expert FFN.  Map
                 # those profiled operations into the dense MLP component
                 # fields so the layer remains a FULL_STAGE_WORLD operation and
                 # does not acquire MoE routing or EP collective semantics.
+                # DeepSeek-style models have a real dense lead-in FFN
+                # (intermediate_size) and must use the mlp_* models instead.
                 mlp_up_proj_time = self._get_share_expert_up_proj_execution_time(batch)
                 mlp_down_proj_time = self._get_share_expert_down_proj_execution_time(batch)
                 mlp_act_time = self._get_share_expert_act_execution_time(batch)
