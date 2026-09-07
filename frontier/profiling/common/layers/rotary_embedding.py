@@ -576,13 +576,35 @@ def get_rope(
     if not _should_prefer_torch_rope_fallback():
         vllm_get_rope = _load_vllm_get_rope()
         if vllm_get_rope is not None:
+            import inspect as _inspect
+
+            _sig_params = _inspect.signature(vllm_get_rope).parameters
+            if "rotary_dim" in _sig_params:
+                return vllm_get_rope(
+                    head_size=head_size,
+                    rotary_dim=rotary_dim,
+                    max_position=max_position,
+                    base=base,
+                    is_neox_style=is_neox_style,
+                    rope_scaling=rope_scaling,
+                    dtype=rope_dtype,
+                )
+            # vLLM >= 0.27 replaced rotary_dim/base/is_neox_style with a
+            # consolidated rope_parameters dict.
+            _rope_parameters = {
+                "rope_type": "default",
+                "rope_theta": base,
+                "max_position": max_position,
+                "rotary_dim": rotary_dim,
+                "is_neox_style": is_neox_style,
+            }
+            if rope_scaling is not None:
+                _rope_parameters.update(rope_scaling)
             return vllm_get_rope(
                 head_size=head_size,
-                rotary_dim=rotary_dim,
                 max_position=max_position,
-                base=base,
                 is_neox_style=is_neox_style,
-                rope_scaling=rope_scaling,
+                rope_parameters=_rope_parameters,
                 dtype=rope_dtype,
             )
 
