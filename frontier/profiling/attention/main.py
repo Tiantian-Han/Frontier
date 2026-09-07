@@ -474,7 +474,7 @@ def parse_args():
     parser.add_argument(
         "--attention_backend",
         default=AttentionBackend.FLASHINFER.value,
-        choices=[e.value for e in AttentionBackend] + ["FLASHINFER_MLA"],
+        choices=[e.value for e in AttentionBackend] + ["FLASHINFER_MLA", "FLASHMLA"],
         help="The attention backend to profile (default: %(default)s)",
     )
     parser.add_argument(
