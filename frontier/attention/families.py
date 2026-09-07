@@ -195,7 +195,14 @@ LATENT_MLA_ATTENTION_FAMILY = AttentionFamilySpec(
         expected_runtime_num_kv_heads=1,
         runtime_head_size_formula="kv_lora_rank + qk_rope_head_dim",
         supported_block_sizes=(32, 64),
-        expected_n_q_head=128,
+        # n_q_head is target-model-derived (e.g. DeepSeek V2 Lite has 16 q
+        # heads while DeepSeek V3 has 128); the importer validates it against
+        # the resolved target model instead of a global constant.
+        expected_n_q_head=None,
+        # Backend is run-derived: legacy H800 probes used FLASHINFER_MLA while
+        # vLLM 0.27.0 production runs for DeepSeek V2 Lite use FLASHMLA. The
+        # importer requires all rows to agree on one backend.
+        expected_attention_backend=None,
     ),
 )
 

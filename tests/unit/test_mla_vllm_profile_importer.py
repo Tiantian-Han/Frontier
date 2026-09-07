@@ -35,6 +35,7 @@ def _base_meta() -> dict[str, object]:
         "alibi_slopes": None,
         "logits_soft_cap": None,
         "attn_type": "decoder",
+        "n_q_head": 128,
         "max_seqlen_q": 1,
         "max_seqlen_k": 65,
         "num_actual_tokens": 1,
@@ -384,6 +385,7 @@ def test_vllm_mla_profile_importer_rejects_unexpected_query_head_count() -> None
             measurement_type="cuda_event",
             num_tensor_parallel_workers=1,
             max_model_len=163840,
+            num_q_heads=128,
         )
 
 

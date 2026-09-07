@@ -141,13 +141,28 @@ def _require_meta(row: dict[str, Any], scope: str) -> dict[str, Any]:
     return meta
 
 
-def _validate_flashinfer_mla_meta(meta: dict[str, Any], scope: str) -> None:
+_SUPPORTED_MLA_ATTENTION_BACKENDS = ("FLASHINFER_MLA", "FLASHMLA")
+
+
+def _validate_flashinfer_mla_meta(
+    meta: dict[str, Any],
+    scope: str,
+    target_num_q_heads: int | None = None,
+) -> None:
     contract = LATENT_MLA_ATTENTION_FAMILY.runtime_meta_contract
     if contract is None:
         raise ValueError("Latent MLA attention family must declare runtime meta contract")
-    if meta["attention_backend"] != "FLASHINFER_MLA":
+    backend = str(meta["attention_backend"])
+    if contract.expected_attention_backend is not None:
+        if backend != contract.expected_attention_backend:
+            raise ValueError(
+                f"Unexpected attention_backend for {scope}: {backend} "
+                f"(contract requires {contract.expected_attention_backend})"
+            )
+    elif backend not in _SUPPORTED_MLA_ATTENTION_BACKENDS:
         raise ValueError(
-            f"Unexpected attention_backend for {scope}: {meta['attention_backend']}"
+            f"Unsupported attention_backend for {scope}: {backend}; "
+            f"expected one of {_SUPPORTED_MLA_ATTENTION_BACKENDS}"
         )
     if meta["use_mla"] is not True:
         raise ValueError(f"use_mla must be true for {scope}")
@@ -156,10 +171,13 @@ def _validate_flashinfer_mla_meta(meta: dict[str, Any], scope: str) -> None:
             f"Unexpected runtime_num_kv_heads for {scope}: "
             f"{meta['runtime_num_kv_heads']}"
         )
+    expected_n_q_head = target_num_q_heads
+    if expected_n_q_head is None:
+        expected_n_q_head = contract.expected_n_q_head
     if (
-        contract.expected_n_q_head is not None
+        expected_n_q_head is not None
         and "n_q_head" in meta
-        and int(meta["n_q_head"]) != contract.expected_n_q_head
+        and int(meta["n_q_head"]) != expected_n_q_head
     ):
         raise ValueError(f"Unexpected n_q_head for {scope}: {meta['n_q_head']}")
     if int(meta["qk_head_dim"]) != (
@@ -320,7 +338,10 @@ def _scope_stats(scope: str, rows: list[dict[str, Any]]) -> _MlaScopeStats:
     )
 
 
-def _validated_scope_rows(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+def _validated_scope_rows(
+    rows: list[dict[str, Any]],
+    target_num_q_heads: int | None = None,
+) -> dict[str, list[dict[str, Any]]]:
     by_scope = _rows_by_scope(rows)
     required_scopes = _required_mla_scopes()
     missing = [scope for scope in required_scopes if not by_scope.get(scope)]
@@ -332,7 +353,9 @@ def _validated_scope_rows(rows: list[dict[str, Any]]) -> dict[str, list[dict[str
     for scope in required_scopes:
         for row in by_scope[scope]:
             meta = _require_meta(row, scope)
-            _validate_flashinfer_mla_meta(meta, scope)
+            _validate_flashinfer_mla_meta(
+                meta, scope, target_num_q_heads=target_num_q_heads
+            )
             _dynamic_profile_shape_signature(row, meta, scope)
             _validate_dynamic_profile_row(row, meta, scope)
             signature = _structural_meta_signature(meta)
@@ -384,11 +407,23 @@ def _build_profile_row_base(
     measurement_type: MeasurementType,
     num_tensor_parallel_workers: int,
     max_model_len: int,
+    num_q_heads: int | None = None,
 ) -> dict[str, Any]:
     contract = LATENT_MLA_ATTENTION_FAMILY.runtime_meta_contract
-    if contract is None or contract.expected_n_q_head is None:
+    if contract is None:
         raise ValueError(
-            "Latent MLA attention family must declare expected_n_q_head"
+            "Latent MLA attention family must declare runtime meta contract"
+        )
+    resolved_n_q_head = num_q_heads
+    if resolved_n_q_head is None and "n_q_head" in representative_meta:
+        resolved_n_q_head = int(representative_meta["n_q_head"])
+    if resolved_n_q_head is None:
+        resolved_n_q_head = contract.expected_n_q_head
+    if resolved_n_q_head is None or int(resolved_n_q_head) <= 0:
+        raise ValueError(
+            "MLA profile import requires the target model's num_q_heads: "
+            "pass num_q_heads explicitly, include n_q_head in the row runtime "
+            "meta, or declare expected_n_q_head on the family contract"
         )
     max_seqlen_k = int(representative_meta["max_seqlen_k"])
     return {
@@ -398,7 +433,7 @@ def _build_profile_row_base(
         "quant_signature": quant_signature,
         "measurement_type": measurement_type.value,
         "attention_backend": str(representative_meta["attention_backend"]),
-        "n_q_head": contract.expected_n_q_head,
+        "n_q_head": int(resolved_n_q_head),
         "n_kv_head": int(representative_meta["runtime_num_kv_heads"]),
         "head_size": int(representative_meta["runtime_head_size"]),
         "qk_nope_head_dim": int(representative_meta["qk_nope_head_dim"]),
@@ -456,13 +491,19 @@ def build_frontier_mla_profile_dataframe(
     measurement_type: str | MeasurementType,
     num_tensor_parallel_workers: int,
     max_model_len: int,
+    num_q_heads: int | None = None,
 ) -> pd.DataFrame:
     """Build a Frontier-compatible attention profiling DataFrame from vLLM MLA rows."""
 
     if not rows:
         raise ValueError("Cannot import empty vLLM MLA row set")
 
-    by_scope = _validated_scope_rows(rows)
+    if num_q_heads is not None and int(num_q_heads) <= 0:
+        raise ValueError(f"num_q_heads must be positive, got {num_q_heads!r}")
+
+    by_scope = _validated_scope_rows(
+        rows, target_num_q_heads=(int(num_q_heads) if num_q_heads is not None else None)
+    )
     grouped_rows = _group_validated_scope_rows(by_scope)
     normalized_measurement_type = (
         measurement_type
@@ -489,6 +530,7 @@ def build_frontier_mla_profile_dataframe(
             measurement_type=normalized_measurement_type,
             num_tensor_parallel_workers=num_tensor_parallel_workers,
             max_model_len=max_model_len,
+            num_q_heads=(int(num_q_heads) if num_q_heads is not None else None),
         )
         for scope in _required_mla_scopes():
             _write_scope_stats(profile_row, scope, scope_rows_by_name.get(scope))
@@ -629,6 +671,7 @@ def load_vllm_mla_profile_dataframe(
     measurement_type: str | MeasurementType,
     num_tensor_parallel_workers: int,
     max_model_len: int,
+    num_q_heads: int | None = None,
 ) -> pd.DataFrame:
     """Load a vLLM MLA JSONL op log and convert it to Frontier profiling schema."""
 
@@ -641,4 +684,5 @@ def load_vllm_mla_profile_dataframe(
         measurement_type=measurement_type,
         num_tensor_parallel_workers=num_tensor_parallel_workers,
         max_model_len=max_model_len,
+        num_q_heads=num_q_heads,
     )

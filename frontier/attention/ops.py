@@ -29,12 +29,19 @@ class AttentionMemoryLayout(Enum):
 
 @dataclass(frozen=True)
 class AttentionRuntimeMetaContract:
-    """Runtime metadata contract for imported attention profiler rows."""
+    """Runtime metadata contract for imported attention profiler rows.
+
+    ``expected_n_q_head`` and ``expected_attention_backend`` are optional:
+    when ``None`` the value is derived from the target model / measured rows
+    instead of a global constant, so families shared across MLA variants
+    (e.g. DeepSeek V2 with 16 q heads vs DeepSeek V3 with 128) stay valid.
+    """
 
     expected_runtime_num_kv_heads: int
     runtime_head_size_formula: str
     supported_block_sizes: tuple[int, ...]
     expected_n_q_head: int | None = None
+    expected_attention_backend: str | None = None
 
     def __post_init__(self) -> None:
         if self.expected_runtime_num_kv_heads <= 0:
@@ -60,6 +67,12 @@ class AttentionRuntimeMetaContract:
             raise ValueError(
                 "expected_n_q_head must be positive when declared, "
                 f"got={self.expected_n_q_head!r}"
+            )
+        if self.expected_attention_backend is not None and not (
+            str(self.expected_attention_backend).strip()
+        ):
+            raise ValueError(
+                "expected_attention_backend must be non-empty when declared"
             )
 
 

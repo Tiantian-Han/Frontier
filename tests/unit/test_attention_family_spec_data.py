@@ -196,4 +196,7 @@ def test_latent_mla_family_declares_runtime_meta_contract() -> None:
     assert contract.expected_runtime_num_kv_heads == 1
     assert contract.runtime_head_size_formula == "kv_lora_rank + qk_rope_head_dim"
     assert contract.supported_block_sizes == (32, 64)
-    assert contract.expected_n_q_head == 128
+    # n_q_head is target-model-derived (DeepSeek V2 Lite has 16, DeepSeek V3
+    # has 128); the family no longer pins a global constant.
+    assert contract.expected_n_q_head is None
+    assert contract.expected_attention_backend is None
