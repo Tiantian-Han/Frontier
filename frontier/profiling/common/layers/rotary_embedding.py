@@ -579,7 +579,27 @@ def get_rope(
             import inspect as _inspect
 
             _sig_params = _inspect.signature(vllm_get_rope).parameters
+            try:
+                from vllm.config import VllmConfig as _VllmConfig
+                from vllm.config import (
+                    set_current_vllm_config as _set_vllm_config,
+                )
+
+                _needs_config_ctx = True
+            except ImportError:
+                _needs_config_ctx = False
             if "rotary_dim" in _sig_params:
+                if _needs_config_ctx:
+                    with _set_vllm_config(_VllmConfig()):
+                        return vllm_get_rope(
+                            head_size=head_size,
+                            rotary_dim=rotary_dim,
+                            max_position=max_position,
+                            base=base,
+                            is_neox_style=is_neox_style,
+                            rope_scaling=rope_scaling,
+                            dtype=rope_dtype,
+                        )
                 return vllm_get_rope(
                     head_size=head_size,
                     rotary_dim=rotary_dim,
@@ -600,6 +620,15 @@ def get_rope(
             }
             if rope_scaling is not None:
                 _rope_parameters.update(rope_scaling)
+            if _needs_config_ctx:
+                with _set_vllm_config(_VllmConfig()):
+                    return vllm_get_rope(
+                        head_size=head_size,
+                        max_position=max_position,
+                        is_neox_style=is_neox_style,
+                        rope_parameters=_rope_parameters,
+                        dtype=rope_dtype,
+                    )
             return vllm_get_rope(
                 head_size=head_size,
                 max_position=max_position,

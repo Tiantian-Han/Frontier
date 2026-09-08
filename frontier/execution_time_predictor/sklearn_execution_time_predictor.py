@@ -932,6 +932,21 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         ):
             return self._get_default_measurement_type_for_cluster()
 
+        # EP lane batches carry synthetic requests whose num_prefill_tokens
+        # reflects routed-token artifacts, not the source batch's phase. When
+        # the propagated decode CUDA-graph metadata marks the source as a
+        # uniform (pure) decode batch under an active graph mode, honor it
+        # before the prefill short-circuit so lane MoE predictions select
+        # the kernel-only family consistently with the attention predictor.
+        metadata = getattr(batch, "decode_cuda_graph_metadata", None)
+        if (
+            metadata is not None
+            and not bool(metadata.is_mixed_batch)
+            and int(metadata.original_decode_batch_size) > 0
+            and str(metadata.runtime_mode) in {"FULL", "PIECEWISE"}
+        ):
+            return MeasurementType.KERNEL_ONLY
+
         if getattr(batch, "num_prefill_tokens", 0) > 0:
             return MeasurementType.CUDA_EVENT
 

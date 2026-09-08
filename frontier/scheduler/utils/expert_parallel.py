@@ -533,6 +533,19 @@ def materialize_batch_group(
     result.total_routed_assignments = routing_token_count * lane.router_topk
     result.moe_pre_routing_effective_total_tokens = plan.pre_routing_effective_total_tokens
     result.source_batches = list(plan.source_batches)
+    # Propagate decode CUDA-graph runtime semantics so the MoE predictor selects
+    # the same measurement family (kernel-only under piecewise graphs) as the
+    # attention predictor for this decode step.  Without this the EPBatchGroup
+    # loses the metadata and silently falls back to the eager family, inflating
+    # decode MoE predictions.  The synthetic lane requests also carry routed
+    # token counts as ``num_prefill_tokens``, which would otherwise trip the
+    # prefill short-circuit in the measurement-family selector.
+    for source_batch in plan.source_batches:
+        if getattr(source_batch, "decode_cuda_graph_metadata", None) is not None:
+            result.decode_cuda_graph_metadata = (
+                source_batch.decode_cuda_graph_metadata
+            )
+            break
     return result
 
 
