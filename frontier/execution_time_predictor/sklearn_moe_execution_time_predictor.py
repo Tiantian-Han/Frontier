@@ -1837,6 +1837,51 @@ class SklearnMoEExecutionTimePredictor(SklearnExecutionTimePredictor):
             for name in self.MOE_LOAD_IMBALANCE_FEATURES
         }
 
+    def _moe_grouped_gemm_includes_assignment(self) -> bool:
+        """Whether the profiled grouped-GEMM term already contains token assignment.
+
+        vLLM >= 0.27 routes MoE expert computation through ``fused_experts()``,
+        whose implementation calls ``_prepare_expert_assignment()`` →
+        ``moe_align_block_size(...)`` before the grouped GEMM (the modular
+        ``TritonExperts`` runtime does the same).  Frontier separately models that
+        alignment work as ``moe_shuffling``.
+
+        When the grouped-GEMM rows were produced by the fused runtime kernel, the
+        alignment step is already inside the measured grouped-GEMM time, so adding
+        the separately measured ``moe_shuffling`` term on top double counts it.
+
+        Only explicit ``moe_grouped_gemm_includes_assignment`` metadata is
+        authoritative. The legacy ``vllm_fused`` backend name was also used by
+        producers that aligned tokens BEFORE the timed region. Never infer a
+        measurement boundary from a kernel/backend name.
+        """
+        path = getattr(self, "_moe_input_file", None)
+        replica = getattr(self, "_replica_config", None)
+        tp = getattr(replica, "moe_tensor_parallel_size", None)
+        ep = getattr(replica, "moe_expert_parallel_size", None)
+        key = (path, tp, ep)
+        cache = getattr(self, "_moe_assignment_scope_cache", {})
+        if key in cache:
+            return cache[key]
+        result = False
+        if path and os.path.exists(path):
+            column = "moe_grouped_gemm_includes_assignment"
+            frame = pd.read_csv(path)
+            for field, value in (("num_tensor_parallel_workers", tp),
+                                 ("expert_parallel_size", ep)):
+                if value is not None and field in frame.columns:
+                    frame = frame[frame[field] == value]
+            if column in frame.columns and not frame.empty:
+                values = frame[column].astype(str).str.strip().str.lower()
+                if not values.isin(["true", "false"]).all():
+                    raise ValueError(f"Invalid {column} metadata in {path}")
+                if values.nunique() != 1:
+                    raise ValueError(f"Mixed assignment measurement scopes in {path}")
+                result = values.iloc[0] == "true"
+        cache[key] = result
+        self._moe_assignment_scope_cache = cache
+        return result
+
     def _get_moe_shuffling_time(
         self,
         batch: Batch,
@@ -1860,6 +1905,18 @@ class SklearnMoEExecutionTimePredictor(SklearnExecutionTimePredictor):
                 "MoE shuffling requires an EPLaneWorkload descriptor when an "
                 "explicit workload is supplied"
             )
+
+        if self._moe_grouped_gemm_includes_assignment():
+            # The grouped-GEMM term already contains the token-assignment step
+            # because it was measured through the fused vLLM runtime kernel.
+            # Adding the separately measured local shuffling term would count the
+            # ``moe_align_block_size`` work twice.
+            logger.debug(
+                "Suppressing the separate moe_shuffling term: the grouped-GEMM "
+                "profile was produced by the fused vLLM runtime kernel, which "
+                "already includes _prepare_expert_assignment/moe_align_block_size."
+            )
+            return 0.0
 
         prediction_cache = self._predictions["moe_shuffling"]
         if isinstance(prediction_cache, dict) and prediction_cache.get(
@@ -2308,11 +2365,18 @@ class SklearnMoEExecutionTimePredictor(SklearnExecutionTimePredictor):
             moe_gating_routing_topk_time = 0.0
             moe_shuffling_time = 0.0
             moe_grouped_gemm_time = 0.0
-            if self._model_config.supports_share_expert():
+            if self._model_config.supports_share_expert() and not (
+                str(
+                    getattr(self._model_config, "model_type", "") or ""
+                ).lower()
+                in {"deepseek_v2", "deepseek_v3", "deepseek_mtp"}
+            ):
                 # Step2Mini/Step3 dense layers are the shared-expert FFN.  Map
                 # those profiled operations into the dense MLP component
                 # fields so the layer remains a FULL_STAGE_WORLD operation and
                 # does not acquire MoE routing or EP collective semantics.
+                # DeepSeek-style models have a real dense lead-in FFN
+                # (intermediate_size) and must use the mlp_* models instead.
                 mlp_up_proj_time = self._get_share_expert_up_proj_execution_time(batch)
                 mlp_down_proj_time = self._get_share_expert_down_proj_execution_time(batch)
                 mlp_act_time = self._get_share_expert_act_execution_time(batch)

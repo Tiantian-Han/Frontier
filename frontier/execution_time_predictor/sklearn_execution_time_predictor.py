@@ -932,6 +932,21 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         ):
             return self._get_default_measurement_type_for_cluster()
 
+        # EP lane batches carry synthetic requests whose num_prefill_tokens
+        # reflects routed-token artifacts, not the source batch's phase. When
+        # the propagated decode CUDA-graph metadata marks the source as a
+        # uniform (pure) decode batch under an active graph mode, honor it
+        # before the prefill short-circuit so lane MoE predictions select
+        # the kernel-only family consistently with the attention predictor.
+        metadata = getattr(batch, "decode_cuda_graph_metadata", None)
+        if (
+            metadata is not None
+            and not bool(metadata.is_mixed_batch)
+            and int(metadata.original_decode_batch_size) > 0
+            and str(metadata.runtime_mode) in {"FULL", "PIECEWISE"}
+        ):
+            return MeasurementType.KERNEL_ONLY
+
         if getattr(batch, "num_prefill_tokens", 0) > 0:
             return MeasurementType.CUDA_EVENT
 
@@ -2738,6 +2753,22 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         if not getattr(self._model_config, "is_moe", False):
             return True
 
+        # DeepSeek-style models have BOTH real dense lead-in FFN layers
+        # (intermediate_size, e.g. DeepSeek V2 Lite layer 0 at 10944) and
+        # shared experts on MoE layers. The shared-expert path must not
+        # suppress dense-layer mlp_* modeling for them.
+        model_type = str(
+            getattr(self._model_config, "model_type", "") or ""
+        ).lower()
+        if model_type in {"deepseek_v2", "deepseek_v3", "deepseek_mtp"}:
+            get_num_moe_layers = getattr(
+                self._model_config, "get_num_moe_layers", None
+            )
+            num_layers = getattr(self._model_config, "num_layers", None)
+            if callable(get_num_moe_layers) and isinstance(num_layers, int):
+                return int(get_num_moe_layers()) < int(num_layers)
+            return True
+
         supports_share_expert = getattr(
             self._model_config, "supports_share_expert", None
         )
@@ -3247,6 +3278,9 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             target_col = f"time_stats.{model_name}.median"
             tp_key = self._get_linear_op_tp_key(model_name)
             compute_df = _get_compute_df_for_model(model_name, tp_key)
+            # _get_compute_df_for_model already selects the operator's typed
+            # width. The legacy scalar can remain routed-width even for a valid
+            # dense contract; applying another scalar filter here loses those rows.
             if target_col not in compute_df.columns:
                 # For model-arch-required operations, raise error instead of warning.
                 # - Architecture profile attention extras, e.g. attn_inter_norm, attn_wq_proj
@@ -7313,6 +7347,14 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         cluster_type: ClusterType,
     ) -> AttentionTime:
         operator_times = self._get_mla_attention_operator_times(batch)
+        # External (model-level) projections and norms are NOT part of the six
+        # MLA physical scopes (they live outside MLACommonImpl in vLLM), but
+        # they still execute every layer. Predict them from the linear-op
+        # models so MLA layer totals are not silently missing this work.
+        attn_norm_time = self._get_attn_norm_layer_act_execution_time(batch)
+        attn_pre_proj_time = self._get_attention_layer_pre_proj_execution_time(batch)
+        attn_rope_time = self._get_attention_rope_execution_time(batch)
+        attn_post_proj_time = self._get_attention_layer_post_proj_execution_time(batch)
         cluster_name = cluster_type.name
         batch_input_lens = [req.num_prefill_tokens for req in batch.requests]
         logger.info(
@@ -7320,16 +7362,45 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             f"num_tokens={batch.total_num_tokens}, batch_size={len(batch.requests)}, "
             f"batch_input_lens={batch_input_lens}, model_type=mla"
         )
+        logger.info(
+            f"[OP-TRACE][{cluster_name}][ATTENTION][input_layernorm] batch_id={batch.id}, layer_id={layer_id}, "
+            f"predicted_time_ms={attn_norm_time:.6f}"
+        )
+        logger.info(
+            f"[OP-TRACE][{cluster_name}][ATTENTION][attn_pre_proj] batch_id={batch.id}, layer_id={layer_id}, "
+            f"predicted_time_ms={attn_pre_proj_time:.6f}"
+        )
+        logger.info(
+            f"[OP-TRACE][{cluster_name}][ATTENTION][attn_rope] batch_id={batch.id}, layer_id={layer_id}, "
+            f"predicted_time_ms={attn_rope_time:.6f}"
+        )
         for op_name, predicted_time_ms in operator_times.op_times.items():
             logger.info(
                 f"[OP-TRACE][{cluster_name}][ATTENTION][{op_name}] batch_id={batch.id}, layer_id={layer_id}, "
                 f"predicted_time_ms={predicted_time_ms:.6f}"
             )
         logger.info(
-            f"[OP-TRACE][{cluster_name}][ATTENTION][TOTAL] batch_id={batch.id}, layer_id={layer_id}, "
-            f"total_attention_time_ms={operator_times.total_time():.6f}"
+            f"[OP-TRACE][{cluster_name}][ATTENTION][attn_post_proj] batch_id={batch.id}, layer_id={layer_id}, "
+            f"predicted_time_ms={attn_post_proj_time:.6f}"
         )
-        return AttentionTime(operator_times=operator_times)
+        total_attention_time_ms = (
+            operator_times.total_time()
+            + attn_norm_time
+            + attn_pre_proj_time
+            + attn_rope_time
+            + attn_post_proj_time
+        )
+        logger.info(
+            f"[OP-TRACE][{cluster_name}][ATTENTION][TOTAL] batch_id={batch.id}, layer_id={layer_id}, "
+            f"total_attention_time_ms={total_attention_time_ms:.6f}"
+        )
+        return AttentionTime(
+            attention_layer_pre_proj_execution_time=attn_pre_proj_time,
+            attention_layer_post_proj_execution_time=attn_post_proj_time,
+            attention_rope_execution_time=attn_rope_time,
+            attn_norm_time=attn_norm_time,
+            operator_times=operator_times,
+        )
 
     def predict_attention_layer_time(
         self, batch: Batch, layer_id: int, cluster_type: ClusterType

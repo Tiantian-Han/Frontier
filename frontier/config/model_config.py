@@ -226,6 +226,19 @@ def _infer_share_expert_dim_from_hf_config(
     if raw_value is None:
         raw_value = cfg.get("shared_expert_intermediate_size")
     if raw_value is None:
+        # DeepSeek-style shared experts: n_shared_experts experts, each with
+        # moe_intermediate_size. vLLM fuses them into one FFN whose total
+        # intermediate dimension is n_shared_experts * moe_intermediate_size.
+        n_shared_experts = cfg.get("n_shared_experts")
+        moe_intermediate_size = cfg.get("moe_intermediate_size")
+        if (
+            isinstance(n_shared_experts, int)
+            and n_shared_experts > 0
+            and isinstance(moe_intermediate_size, int)
+            and moe_intermediate_size > 0
+        ):
+            raw_value = n_shared_experts * moe_intermediate_size
+    if raw_value is None:
         return None
 
     share_expert_dim = int(raw_value)
@@ -249,6 +262,11 @@ class BaseModelConfig(BaseFixedConfig):
     norm: NormType
     post_attn_norm: bool
     vocab_size: int
+    # Dense-layer FFN intermediate dimension. For pure dense models this
+    # equals mlp_hidden_dim. For MoE models with dense lead-in layers
+    # (e.g. DeepSeek V2 Lite layer 0) this is intermediate_size while
+    # mlp_hidden_dim stays moe_intermediate_size (per-expert dim).
+    dense_mlp_hidden_dim: Optional[int] = None
     use_qk_norm: bool = False
     attn_output_gate: bool = False
     is_neox_style: Optional[bool] = True

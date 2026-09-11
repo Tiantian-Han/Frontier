@@ -16,10 +16,56 @@ try:
 
     HAS_VLLM_RMSNORM = True
 except ImportError:
-    HAS_VLLM_RMSNORM = False
-    VllmGemmaRMSNorm = None
-    vllm_rms_norm = None
-    vllm_fused_add_rms_norm = None
+    # vLLM >= 0.27: RMSNorm became a CustomOp without module-level rms_norm /
+    # fused_add_rms_norm functions. Fall back to dispatching through the
+    # CustomOp instances under a default vLLM config context.
+    try:
+        from vllm.config import VllmConfig, set_current_vllm_config
+        from vllm.model_executor.layers.layernorm import (
+            GemmaRMSNorm as VllmGemmaRMSNorm,
+            RMSNorm as VllmRMSNormClass,
+        )
+
+        def _vllm_default_config_context():
+            return set_current_vllm_config(VllmConfig())
+
+        HAS_VLLM_RMSNORM = True
+
+        class _VllmRmsNormShim:
+            """Dispatches vLLM 0.27+ RMSNorm CustomOp as a plain function.
+
+            Mirrors the pre-0.27 module-level function signatures:
+              rms_norm(x, weight, eps)
+              fused_add_rms_norm(x, residual, weight, eps) -> (out, residual)
+            """
+
+            def __init__(self, use_fused_add: bool):
+                self._use_fused_add = use_fused_add
+                with _vllm_default_config_context():
+                    self._op = VllmRMSNormClass(1, eps=1e-6)
+
+            def _bind(self, weight, eps):
+                self._op.variance_epsilon = eps
+                # Replace the weight slot so the CustomOp forward sees the
+                # caller's weight (plain attribute bypasses Parameter checks).
+                object.__setattr__(self._op, "weight", weight)
+
+            def __call__(self, *args):
+                if self._use_fused_add:
+                    x, residual, weight, eps = args
+                    self._bind(weight, eps)
+                    return self._op(x, residual)
+                x, weight, eps = args
+                self._bind(weight, eps)
+                return self._op(x)
+
+        vllm_rms_norm = _VllmRmsNormShim(use_fused_add=False)
+        vllm_fused_add_rms_norm = _VllmRmsNormShim(use_fused_add=True)
+    except Exception:
+        HAS_VLLM_RMSNORM = False
+        VllmGemmaRMSNorm = None
+        vllm_rms_norm = None
+        vllm_fused_add_rms_norm = None
 
 
 class RMSNorm(nn.Module):

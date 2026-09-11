@@ -61,6 +61,15 @@ def build_ep_lane_batch(
     lane_batch.source_batches = [source_batch]
     lane_batch.decode_ffn_layer_id = layer_id
     lane_batch.afd_stage_idx = getattr(source_batch, "afd_stage_idx", None)
+    # Propagate decode CUDA-graph runtime semantics so the MoE predictor selects
+    # the same measurement family (kernel-only under piecewise graphs) as the
+    # attention predictor for this decode step.  The synthetic lane requests
+    # carry routed token counts as ``num_prefill_tokens``, so without the
+    # metadata the selector would short-circuit to the eager family.
+    if getattr(source_batch, "decode_cuda_graph_metadata", None) is not None:
+        lane_batch.decode_cuda_graph_metadata = (
+            source_batch.decode_cuda_graph_metadata
+        )
     effective_tokens_getter = getattr(source_batch, "get_effective_total_tokens_for_compute", None)
     effective_tokens = (
         int(effective_tokens_getter(cluster_type))

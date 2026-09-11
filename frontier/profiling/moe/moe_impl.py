@@ -12,6 +12,7 @@ not a compute parameter. We profile operations per-device, using num_experts_per
 Implementation: Uses Frontier profiling operators for consistency with MLP profiling.
 """
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -36,9 +37,32 @@ try:
 
     HAS_VLLM = True
     _VLLM_IMPORT_ERROR = None
-except ImportError as exc:  # pragma: no cover - fail fast when vLLM missing
-    HAS_VLLM = False
-    _VLLM_IMPORT_ERROR = exc
+except ImportError:
+    # vLLM >= 0.27 moved fused_topk to the router package and renamed
+    # get_config_dtype_str to _get_config_dtype_str.
+    try:
+        from vllm.model_executor.layers.fused_moe.router.fused_topk_router import (
+            fused_topk,
+        )
+        from vllm.model_executor.layers.fused_moe.fused_moe import (
+            try_get_optimal_moe_config,
+        )
+        from vllm.model_executor.layers.fused_moe.config import (
+            _get_config_dtype_str as get_config_dtype_str,
+        )
+        from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+            moe_align_block_size,
+        )
+
+        HAS_VLLM = True
+        _VLLM_IMPORT_ERROR = None
+    except ImportError as exc:
+        HAS_VLLM = False
+        fused_topk = None
+        try_get_optimal_moe_config = None
+        get_config_dtype_str = None
+        moe_align_block_size = None
+        _VLLM_IMPORT_ERROR = exc
 
 try:
     from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -47,6 +71,40 @@ try:
 except ImportError:
     ReplicatedLinear = None  # type: ignore[assignment]
     HAS_VLLM_REPLICATED_LINEAR = False
+
+
+def ensure_vllm_profiling_runtime() -> None:
+    """Initialize the minimal vLLM runtime needed by the MoE profiler.
+
+    vLLM >= 0.27 requires (a) a current VllmConfig for CustomOp dispatch and
+    (b) an initialized TP group for ReplicatedLinear. Both are process-wide
+    and idempotent for the single-process profiling use case.
+    """
+    if not HAS_VLLM:
+        return
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.distributed import (
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from vllm.distributed.parallel_state import model_parallel_is_initialized
+
+    # The MoE CLI uses worker processes. A single fixed rendezvous port makes
+    # concurrent workers race and, because the old implementation swallowed the
+    # exception, the later ReplicatedLinear constructor failed with the much less
+    # actionable "TP group is not initialized" error. Use a deterministic
+    # per-process port and fail at the bootstrap boundary with the real error.
+    if model_parallel_is_initialized():
+        return
+    port = 29599 + (os.getpid() % 1000)
+    with set_current_vllm_config(VllmConfig()):
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            local_rank=0,
+            distributed_init_method=f"tcp://127.0.0.1:{port}",
+        )
+        initialize_model_parallel(tensor_model_parallel_size=1)
 
 
 def uniform_topk(
@@ -96,6 +154,14 @@ class MoEGatingNetwork(nn.Module):
     - moe_gating_routing_topk: TopK selection + Softmax normalization
     """
 
+    _RUNTIME_BOOTSTRAPPED = False
+
+    @classmethod
+    def _bootstrap_vllm_runtime(cls) -> None:
+        if not cls._RUNTIME_BOOTSTRAPPED:
+            ensure_vllm_profiling_runtime()
+            cls._RUNTIME_BOOTSTRAPPED = True
+
     def __init__(
         self,
         hidden_dim: int,
@@ -128,6 +194,7 @@ class MoEGatingNetwork(nn.Module):
             )
 
         if self.use_vllm_fused_topk and HAS_VLLM_REPLICATED_LINEAR:
+            self._bootstrap_vllm_runtime()
             # Align gating linear kernel family with vLLM runtime contract.
             # disable_tp=True avoids requiring TP group initialization in profiling jobs.
             self.gate = ReplicatedLinear(

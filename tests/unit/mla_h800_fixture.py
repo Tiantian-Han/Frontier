@@ -22,6 +22,7 @@ _BASE_META: dict[str, Any] = {
     "alibi_slopes": None,
     "logits_soft_cap": None,
     "attn_type": "decoder",
+    "n_q_head": 128,
 }
 
 

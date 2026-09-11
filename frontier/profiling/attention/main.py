@@ -474,7 +474,7 @@ def parse_args():
     parser.add_argument(
         "--attention_backend",
         default=AttentionBackend.FLASHINFER.value,
-        choices=[e.value for e in AttentionBackend] + ["FLASHINFER_MLA"],
+        choices=[e.value for e in AttentionBackend] + ["FLASHINFER_MLA", "FLASHMLA"],
         help="The attention backend to profile (default: %(default)s)",
     )
     parser.add_argument(
@@ -486,6 +486,15 @@ def parse_args():
             "and write a Frontier-compatible attention profiling CSV. This is an "
             "explicit truth-source import path, not a replacement for native dense "
             "FlashInfer profiling."
+        ),
+    )
+    parser.add_argument(
+        "--mla_num_q_heads",
+        type=int,
+        default=None,
+        help=(
+            "Explicit target-model q-head count for --vllm_mla_cuda_op_log imports. "
+            "Defaults to the resolved model config's num_attention_heads."
         ),
     )
     parser.add_argument(
@@ -803,10 +812,15 @@ def _validate_cli_conflicts(args: argparse.Namespace) -> None:
             "It is only valid for co-location mixed-batch profiling and cannot be combined with "
             "--profile_only_prefill or --profile_only_decode."
         )
-    if args.attention_backend == "FLASHINFER_MLA" and args.vllm_mla_cuda_op_log is None:
+    _MLA_IMPORT_BACKENDS = ("FLASHINFER_MLA", "FLASHMLA")
+    if (
+        args.attention_backend in _MLA_IMPORT_BACKENDS
+        and args.vllm_mla_cuda_op_log is None
+    ):
         raise ValueError(
-            "--attention_backend FLASHINFER_MLA requires --vllm_mla_cuda_op_log. "
-            "Frontier does not yet provide a native FlashInfer MLA profiling backend."
+            "--attention_backend FLASHINFER_MLA/FLASHMLA requires "
+            "--vllm_mla_cuda_op_log. Frontier does not yet provide a native "
+            "MLA profiling backend."
         )
     if args.vllm_mla_cuda_op_log is not None:
         if len(args.models) != 1:
@@ -815,9 +829,10 @@ def _validate_cli_conflicts(args: argparse.Namespace) -> None:
             raise ValueError(
                 "--vllm_mla_cuda_op_log requires exactly one tensor parallel size."
             )
-        if args.attention_backend != "FLASHINFER_MLA":
+        if args.attention_backend not in _MLA_IMPORT_BACKENDS:
             raise ValueError(
-                "--vllm_mla_cuda_op_log requires --attention_backend FLASHINFER_MLA."
+                "--vllm_mla_cuda_op_log requires --attention_backend "
+                "FLASHINFER_MLA or FLASHMLA."
             )
         if args.enable_mixed_prefill or args.enable_true_mixed:
             raise ValueError(
@@ -1035,6 +1050,17 @@ def _run_vllm_mla_profile_import(args: argparse.Namespace) -> Path:
     )
     measurement_type = profile_method_to_measurement_type(args.profile_method).value
 
+    num_q_heads = getattr(args, "mla_num_q_heads", None)
+    if num_q_heads is None:
+        try:
+            num_q_heads = int(
+                ModelConfig.from_model_name(model).num_q_heads
+            )
+        except ValueError:
+            # Fall back to row runtime meta / family contract inside the
+            # importer, which raises a clear error when neither is available.
+            num_q_heads = None
+
     vllm_rows = load_vllm_mla_rows(args.vllm_mla_cuda_op_log)
     df = build_frontier_mla_profile_dataframe(
         vllm_rows,
@@ -1045,6 +1071,7 @@ def _run_vllm_mla_profile_import(args: argparse.Namespace) -> Path:
         measurement_type=measurement_type,
         num_tensor_parallel_workers=args.num_tensor_parallel_workers[0],
         max_model_len=args.max_model_len,
+        num_q_heads=num_q_heads,
     )
     df = _attach_attention_output_metadata(
         df,

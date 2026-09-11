@@ -98,6 +98,7 @@ def _base_meta(
         "alibi_slopes": None,
         "logits_soft_cap": None,
         "attn_type": "decoder",
+        "n_q_head": 128,
         "max_seqlen_q": max_seqlen_q,
         "max_seqlen_k": max_seqlen_k,
         "num_actual_tokens": num_actual_tokens,
