@@ -1837,6 +1837,52 @@ class SklearnMoEExecutionTimePredictor(SklearnExecutionTimePredictor):
             for name in self.MOE_LOAD_IMBALANCE_FEATURES
         }
 
+    def _moe_grouped_gemm_includes_assignment(self) -> bool:
+        """Whether the profiled grouped-GEMM term already contains token assignment.
+
+        vLLM >= 0.27 routes MoE expert computation through ``fused_experts()``,
+        whose implementation calls ``_prepare_expert_assignment()`` →
+        ``moe_align_block_size(...)`` before the grouped GEMM (the modular
+        ``TritonExperts`` runtime does the same).  Frontier separately models that
+        alignment work as ``moe_shuffling``.
+
+        When the grouped-GEMM rows were produced by the fused runtime kernel, the
+        alignment step is already inside the measured grouped-GEMM time, so adding
+        the separately measured ``moe_shuffling`` term on top double counts it.
+
+        Provenance is recorded per profile row in ``moe_grouped_gemm_backend`` by
+        the MoE profiler.  Non-fused producers (``frontier_loop``) keep the
+        separate term because there the alignment is not part of the grouped-GEMM
+        measurement.
+        """
+
+        cached = getattr(
+            self, "_moe_grouped_gemm_includes_assignment_cached", None
+        )
+        if cached is not None:
+            return cached
+
+        includes_assignment = False
+        moe_input_file = getattr(self, "_moe_input_file", None)
+        if moe_input_file and os.path.exists(moe_input_file):
+            try:
+                backend_df = pd.read_csv(
+                    moe_input_file, usecols=["moe_grouped_gemm_backend"]
+                )
+            except (ValueError, OSError):
+                # Legacy profiles predate the provenance column; their grouped-GEMM
+                # term semantics are unchanged, so keep the separate term.
+                backend_df = None
+            if backend_df is not None and len(backend_df.index) > 0:
+                backends = {
+                    str(value).strip()
+                    for value in backend_df["moe_grouped_gemm_backend"].dropna()
+                }
+                includes_assignment = "vllm_fused" in backends
+
+        self._moe_grouped_gemm_includes_assignment_cached = includes_assignment
+        return includes_assignment
+
     def _get_moe_shuffling_time(
         self,
         batch: Batch,
@@ -1860,6 +1906,18 @@ class SklearnMoEExecutionTimePredictor(SklearnExecutionTimePredictor):
                 "MoE shuffling requires an EPLaneWorkload descriptor when an "
                 "explicit workload is supplied"
             )
+
+        if self._moe_grouped_gemm_includes_assignment():
+            # The grouped-GEMM term already contains the token-assignment step
+            # because it was measured through the fused vLLM runtime kernel.
+            # Adding the separately measured local shuffling term would count the
+            # ``moe_align_block_size`` work twice.
+            logger.debug(
+                "Suppressing the separate moe_shuffling term: the grouped-GEMM "
+                "profile was produced by the fused vLLM runtime kernel, which "
+                "already includes _prepare_expert_assignment/moe_align_block_size."
+            )
+            return 0.0
 
         prediction_cache = self._predictions["moe_shuffling"]
         if isinstance(prediction_cache, dict) and prediction_cache.get(
