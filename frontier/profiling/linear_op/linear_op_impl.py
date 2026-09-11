@@ -552,10 +552,25 @@ class DeepseekV2MlaCausalSelfAttention(torch.nn.Module):
     """MLA external projections for DeepSeek V2 style models.
 
     Models the q_lora_rank=None path of vLLM DeepseekV2MLAAttention:
-      q_proj:      hidden -> heads * qk_head_dim   (column-parallel)  [attn_pre_proj]
-      kv_a_proj:   hidden -> kv_lora + qk_rope     (replicated)       [attn_pre_proj]
-      rope:        q_pe / k_pe                                        [attn_rope]
-      o_proj:      heads * v_dim -> hidden          (row-parallel)     [attn_post_proj]
+      q_proj:            hidden -> heads * qk_head_dim   (column-parallel) [attn_q_proj]
+      kv_a_proj_with_mqa: hidden -> kv_lora + qk_rope    (replicated)      [attn_kv_a_proj]
+      kv_a_layernorm:     RMSNorm over kv_lora_rank                        (bundled)
+      attn_pre_proj:      the three operations above, measured as one
+                          per-forward composite                        [attn_pre_proj]
+      rope:               q_pe / k_pe                                     [attn_rope]
+      o_proj:             heads * v_dim -> hidden        (row-parallel)   [attn_post_proj]
+
+    Two accounting rules matter here and are enforced by this module:
+
+    1. ``attn_pre_proj`` is the *sum* of q_proj + kv_a_proj_with_mqa +
+       kv_a_layernorm within a single forward. Giving several different
+       operators the same timer name would make ``TimerStatsStore`` take a
+       median over interleaved samples of unrelated operations instead of a
+       sum, which understates the combined pre-projection cost.
+    2. ``kv_a_layernorm`` is part of the real vLLM op sequence
+       (vLLM 0.27 ``model_executor/layers/mla.py``:
+       ``kv_c_normed = self.kv_a_layernorm(kv_c)``) and is therefore executed
+       here, not skipped.
 
     The latent attention core itself is covered by the imported six-scope
     MLA attention profile, never by the linear-op profiler.
@@ -582,12 +597,17 @@ class DeepseekV2MlaCausalSelfAttention(torch.nn.Module):
         if config.quantization_config is not None:
             fp8_block_size = config.quantization_config.weight_block_size
 
+        # Per-operator timers keep each sub-operator visible, while the
+        # composite ``attn_pre_proj`` timer in forward() records the per-forward
+        # sum. ``precision_op_name`` keeps the quantization contract bound to
+        # the canonical composite name.
         self.q_proj = ColumnParallelLinear(
             config.embedding_dim,
             config.num_q_heads * self.qk_head_dim,
             bias=False,
             gather_output=False,
-            linear_metric_name="attn_pre_proj",
+            linear_metric_name="attn_q_proj",
+            precision_op_name="attn_pre_proj",
             fp8_weight_block_size=fp8_block_size,
             world_size=world_size,
         )
@@ -595,10 +615,20 @@ class DeepseekV2MlaCausalSelfAttention(torch.nn.Module):
             config.embedding_dim,
             self.kv_lora_rank + self.qk_rope_head_dim,
             bias=False,
-            linear_metric_name="attn_pre_proj",
+            linear_metric_name="attn_kv_a_proj",
+            precision_op_name="attn_pre_proj",
             fp8_weight_block_size=fp8_block_size,
             world_size=world_size,
         )
+        # Untimed on purpose: its cost is captured by the composite
+        # ``attn_pre_proj`` timer, matching the vLLM op sequence where the norm
+        # runs between the two projections and the latent up-projection.
+        self.kv_a_layernorm = RMSNorm(
+            self.kv_lora_rank,
+            eps=getattr(config, "rms_norm_eps", 1e-6),
+            norm_name=None,
+        )
+        self._attn_pre_proj_timer = CudaTimer("attn_pre_proj")
         self.o_proj = RowParallelLinear(
             config.num_q_heads * self.v_head_dim,
             config.embedding_dim,
@@ -627,8 +657,21 @@ class DeepseekV2MlaCausalSelfAttention(torch.nn.Module):
             )
 
     def forward(self, hidden_states, positions):
-        q, _ = self.q_proj(hidden_states)
-        kv, _ = self.kv_a_proj_with_mqa(hidden_states)
+        # One composite measurement for the whole pre-projection block, so the
+        # recorded ``attn_pre_proj`` value is the per-forward sum of the three
+        # distinct operators rather than a median over interleaved samples.
+        with self._attn_pre_proj_timer:
+            q, _ = self.q_proj(hidden_states)
+            kv, _ = self.kv_a_proj_with_mqa(hidden_states)
+            # Mirrors vLLM: normalize only the kv_lora_rank slice. The result
+            # feeds kv_b_proj inside the MLA attention scopes, so it is not
+            # consumed here; the call exists to reproduce the real op sequence
+            # and is deliberately inside the composite timer.  The slice stays a
+            # strided view on purpose: vLLM normalizes the view produced by
+            # ``split`` and never materialises a contiguous copy, and the vLLM
+            # RMSNorm kernel accepts a non-contiguous last-dim slice.
+            kv_c_normed = self.kv_a_layernorm(kv[:, : self.kv_lora_rank])
+            del kv_c_normed
         q = q.view(-1, self.heads_per_worker, self.qk_head_dim)
         q_nope, q_pe = torch.split(
             q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
