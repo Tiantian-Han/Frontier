@@ -8,7 +8,7 @@
 
 - 基线：上游 `NetX-lab/Frontier` `main` = `d71ad80b0800880808a0857fd30477e6d96592c6`
 - 分支：`review/deepseek-v2-lite-upstream`
-- 提交数：8（5 个功能提交 + 2 个测量修复 + 1 个文档提交）
+- 提交数：9（5 个功能提交 + 2 个测量修复 + 1 个文档提交 + 1 个 profile 重采提交）
 
 ---
 
@@ -40,12 +40,10 @@
 
 两个必须明确的后果：
 
-1. **本分支的 `linear_op.csv` 是 legacy（非 typed）CSV**，不含 `typed_operator_contracts` 列。
-   上游的非 typed 路径会硬过滤 `n_expanded_embd == mlp_hidden_dim`，对混合 dense+MoE 模型会
-   丢掉 10944 的 dense 行并抛 "No compute profiling rows remain"。因此本分支把该过滤放宽为
-   `{mlp_hidden_dim} ∪ {dense_mlp_hidden_dim}`。**该改动只扩容、不缩容**：对上游所有既有非 typed
-   CSV，其行宽全为 `mlp_hidden_dim`，实际过滤结果不变；typed 路径（存在 `typed_operator_contracts`
-   列时）优先级更高且未被触碰。
+1. **本分支的 linear profile 已完成修复后重采**，包含 `typed_operator_contracts` 列。
+   两个文件均为 777 行（259 个 token 点 × TP1/2/4）；`mlp_*` contract 明确绑定
+   `dense_mlp_hidden_dim=10944`，shared expert 保留独立 contract。此前为兼容旧 CSV 加入的
+   legacy 宽度放宽仍保留，但新 DeepSeek profile 已走上游 typed-contract 路径。
 2. **上游所有已入库的 MoE profile 都是 `vllm_fused`**（见第 2.3 节），因此第 2.3 节的修复会
    改变所有 MoE 模型的分层时间——这是**精度修正**，不是回退，但属于行为变化，必须显式声明。
 
@@ -259,8 +257,8 @@ shim 缺陷。**
 | `data/config/models/DeepSeek__DeepSeekV2-Lite.json` | 让 Frontier 正确解析模型结构：16 q head、`q_lora_rank=null`、`qk_nope_head_dim=128`、`qk_rope_head_dim=64`、`v_head_dim=128`、`kv_lora_rank=512`、`intermediate_size=10944`、`moe_intermediate_size=1408`、64 路由 + 2 shared、top-6、`moe_layers_enum=1..26` |
 | `.../h100/DeepSeek/DeepSeekV2-Lite/attention.csv` | FLASHMLA 六 scope CUDA-event 测量，TP1/2/4、H100、BF16、block 64 |
 | `.../attention_kernel_only.csv` | 同上形状的 kernel-only 家族，供 piecewise CUDA Graph 下的纯 decode 使用 |
-| `.../linear_op.csv` | MLA 外部投影 + `o_proj` + dense FFN 10944 + shared expert 2816，vLLM 0.27.0 内核测量，tokens 1..4096，TP1/2/4 |
-| `.../linear_op_kernel_only.csv` | 同上 kernel-only 家族 |
+| `.../linear_op.csv` | 修复后重采：MLA 外部投影 + `o_proj` + dense FFN 10944 + shared expert 2816，vLLM 0.27.0 IR-native 路径，259 token 点、TP1/2/4，含 typed contracts |
+| `.../linear_op_kernel_only.csv` | 同上 kernel-only 家族；`attn_pre_proj` 是同一 forward 的 q/kv/norm 复合计时 |
 | `.../moe.csv` | vLLM 0.27 `fused_experts()` 生产内核，TP×EP 网格，uniform 路由 |
 | `.../moe_kernel_only.csv` | 同上 kernel-only 家族 |
 
@@ -364,9 +362,10 @@ docker run --rm --gpus '"device=0"' ... ontos:vllm-0.27.0 \
 
 ## 6. 数据重采状态与命令
 
-`linear_op.csv` / `linear_op_kernel_only.csv` 目前仍是**修复前**口径（同名中位数、无
-`kv_a_layernorm`），**必须重采**。重采应直接使用本次已修复的 profiler，并保留真实 vLLM 的
-IR-native RMSNorm 路径，确保新 profile 的 `attn_pre_proj` 是单次 forward 三项之和。
+`linear_op.csv` / `linear_op_kernel_only.csv` 已使用本次修复后的 profiler 重采并写回仓库。
+两个文件各 777 行（259 个 token 点 × TP1/2/4），并包含 `typed_operator_contracts`；其中
+`mlp_*` 明确绑定 `dense_mlp_hidden_dim=10944`，shared-expert contract 独立保留。
+重采保留真实 vLLM 的 IR-native RMSNorm 路径，`attn_pre_proj` 是同一 forward 三项之和。
 
 重采网格（从现有 CSV 反推，共 259 个 token 点，与原数据逐点可比）：
 
@@ -405,13 +404,12 @@ IR-native RMSNorm 路径，确保新 profile 的 `attn_pre_proj` 是单次 forwa
 
 ## 8. 遗留事项（按优先级）
 
-1. **P0｜重采 `linear_op.csv` / `linear_op_kernel_only.csv`**（第 6 节），使数据与已修
-   的 profiler 口径一致。重采应继续使用真实服务的 IR-native RMSNorm 路径。
-2. **P1｜迁移到 typed operator contract**：让 DeepSeek 的 `linear_op.csv` 携带
-   `typed_operator_contracts` 列，从而删除本分支对 legacy 宽度过滤的放宽。
-3. **P1｜确认 MoE 去重带来的既有基线变化**：第 2.3 节的修复会改变所有 `vllm_fused`
+1. **P0｜重采 `linear_op.csv` / `linear_op_kernel_only.csv`**（第 6 节）已完成；两个文件均为 777 行，并含 typed contracts。重采应继续使用真实服务的 IR-native RMSNorm 路径。
+2. **P1｜确认 MoE 去重带来的既有基线变化**：第 2.3 节的修复会改变所有 `vllm_fused`
    profile 的 MoE 分层时间，需要同步更新受影响的期望值/回归基线。
-5. **P2｜`_ffn_construction_dim` 已删除**，`profiling_plan.py` 完全交由上游 typed contract 驱动。
+3. **P2｜`_ffn_construction_dim` 已删除**，`profiling_plan.py` 完全交由上游 typed contract 驱动。
+4. **P2｜继续做真实 CUDA Graph replay profile**：当前 kernel-only 是 IR-native device-time
+   profile；若要建模 graph replay 调度开销，需要独立 graph-mode 采集。
 
 ---
 
