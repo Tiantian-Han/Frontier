@@ -1850,38 +1850,37 @@ class SklearnMoEExecutionTimePredictor(SklearnExecutionTimePredictor):
         alignment step is already inside the measured grouped-GEMM time, so adding
         the separately measured ``moe_shuffling`` term on top double counts it.
 
-        Provenance is recorded per profile row in ``moe_grouped_gemm_backend`` by
-        the MoE profiler.  Non-fused producers (``frontier_loop``) keep the
-        separate term because there the alignment is not part of the grouped-GEMM
-        measurement.
+        Only explicit ``moe_grouped_gemm_includes_assignment`` metadata is
+        authoritative. The legacy ``vllm_fused`` backend name was also used by
+        producers that aligned tokens BEFORE the timed region. Never infer a
+        measurement boundary from a kernel/backend name.
         """
-
-        cached = getattr(
-            self, "_moe_grouped_gemm_includes_assignment_cached", None
-        )
-        if cached is not None:
-            return cached
-
-        includes_assignment = False
-        moe_input_file = getattr(self, "_moe_input_file", None)
-        if moe_input_file and os.path.exists(moe_input_file):
-            try:
-                backend_df = pd.read_csv(
-                    moe_input_file, usecols=["moe_grouped_gemm_backend"]
-                )
-            except (ValueError, OSError):
-                # Legacy profiles predate the provenance column; their grouped-GEMM
-                # term semantics are unchanged, so keep the separate term.
-                backend_df = None
-            if backend_df is not None and len(backend_df.index) > 0:
-                backends = {
-                    str(value).strip()
-                    for value in backend_df["moe_grouped_gemm_backend"].dropna()
-                }
-                includes_assignment = "vllm_fused" in backends
-
-        self._moe_grouped_gemm_includes_assignment_cached = includes_assignment
-        return includes_assignment
+        path = getattr(self, "_moe_input_file", None)
+        replica = getattr(self, "_replica_config", None)
+        tp = getattr(replica, "moe_tensor_parallel_size", None)
+        ep = getattr(replica, "moe_expert_parallel_size", None)
+        key = (path, tp, ep)
+        cache = getattr(self, "_moe_assignment_scope_cache", {})
+        if key in cache:
+            return cache[key]
+        result = False
+        if path and os.path.exists(path):
+            column = "moe_grouped_gemm_includes_assignment"
+            frame = pd.read_csv(path)
+            for field, value in (("num_tensor_parallel_workers", tp),
+                                 ("expert_parallel_size", ep)):
+                if value is not None and field in frame.columns:
+                    frame = frame[frame[field] == value]
+            if column in frame.columns and not frame.empty:
+                values = frame[column].astype(str).str.strip().str.lower()
+                if not values.isin(["true", "false"]).all():
+                    raise ValueError(f"Invalid {column} metadata in {path}")
+                if values.nunique() != 1:
+                    raise ValueError(f"Mixed assignment measurement scopes in {path}")
+                result = values.iloc[0] == "true"
+        cache[key] = result
+        self._moe_assignment_scope_cache = cache
+        return result
 
     def _get_moe_shuffling_time(
         self,

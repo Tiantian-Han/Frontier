@@ -1295,21 +1295,7 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             )
             df = cast(pd.DataFrame, df[typed_mask].copy())
         elif not has_typed_contracts:
-            # A legacy CSV carries exactly one scalar width, unless the model
-            # declares a distinct dense lead-in FFN domain (e.g. DeepSeek V2
-            # Lite layer 0 at intermediate_size=10944 alongside routed 1408).
-            # Keep the scalar contract, and admit the declared dense width so
-            # mixed models can resolve dense and routed rows per operator.
-            allowed_expanded_dims = {int(expanded_width)}
-            dense_mlp_hidden_dim = getattr(
-                self._model_config, "dense_mlp_hidden_dim", None
-            )
-            if dense_mlp_hidden_dim is not None:
-                allowed_expanded_dims.add(int(dense_mlp_hidden_dim))
-            df = cast(
-                pd.DataFrame,
-                df[df["n_expanded_embd"].isin(allowed_expanded_dims)],
-            )
+            df = cast(pd.DataFrame, df[df["n_expanded_embd"] == expanded_width])
 
         expected_use_qk_norm = bool(getattr(self._model_config, "use_qk_norm", False))
         if expected_use_qk_norm and "use_qk_norm" not in df.columns:
@@ -3292,33 +3278,9 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             target_col = f"time_stats.{model_name}.median"
             tp_key = self._get_linear_op_tp_key(model_name)
             compute_df = _get_compute_df_for_model(model_name, tp_key)
-            if model_name in ("mlp_up_proj", "mlp_act", "mlp_down_proj"):
-                # DeepSeek-style MoE models carry a real dense lead-in FFN
-                # (dense_mlp_hidden_dim, e.g. 10944) alongside routed expert
-                # rows (mlp_hidden_dim, e.g. 1408). Train the dense models only
-                # on dense-width rows so they never learn expert-shaped data.
-                # Legacy non-typed CSVs are the only source of mixed-width rows:
-                # once a CSV carries typed_operator_contracts the typed path above
-                # already selects the right width per operator.
-                dense_mlp_hidden_dim = getattr(
-                    self._model_config, "dense_mlp_hidden_dim", None
-                )
-                if (
-                    dense_mlp_hidden_dim is not None
-                    and int(dense_mlp_hidden_dim)
-                    != int(self._model_config.mlp_hidden_dim)
-                ):
-                    compute_df = compute_df[
-                        compute_df["n_expanded_embd"].astype(int)
-                        == int(dense_mlp_hidden_dim)
-                    ]
-                    if compute_df.empty:
-                        raise ValueError(
-                            "No dense FFN profiling rows at "
-                            f"n_expanded_embd={int(dense_mlp_hidden_dim)} for "
-                            f"TP={tp_key}. Re-run linear-op profiling with the "
-                            "dense intermediate_size FFN dimension."
-                        )
+            # _get_compute_df_for_model already selects the operator's typed
+            # width. The legacy scalar can remain routed-width even for a valid
+            # dense contract; applying another scalar filter here loses those rows.
             if target_col not in compute_df.columns:
                 # For model-arch-required operations, raise error instead of warning.
                 # - Architecture profile attention extras, e.g. attn_inter_norm, attn_wq_proj

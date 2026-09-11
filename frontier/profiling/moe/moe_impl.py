@@ -12,6 +12,7 @@ not a compute parameter. We profile operations per-device, using num_experts_per
 Implementation: Uses Frontier profiling operators for consistency with MLP profiling.
 """
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -81,29 +82,29 @@ def ensure_vllm_profiling_runtime() -> None:
     """
     if not HAS_VLLM:
         return
-    try:
-        from vllm.config import VllmConfig, set_current_vllm_config
-        from vllm.distributed import (
-            init_distributed_environment,
-            initialize_model_parallel,
-        )
-        from vllm.distributed.parallel_state import (
-            model_parallel_is_initialized,
-        )
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.distributed import (
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from vllm.distributed.parallel_state import model_parallel_is_initialized
 
-        with set_current_vllm_config(VllmConfig()):
-            init_distributed_environment(
-                world_size=1,
-                rank=0,
-                local_rank=0,
-                distributed_init_method="tcp://127.0.0.1:29599",
-            )
-            if not model_parallel_is_initialized():
-                initialize_model_parallel(tensor_model_parallel_size=1)
-    except Exception:
-        # Older vLLM versions do not need this bootstrap; ignore failures so
-        # the existing behavior is preserved when the runtime is unnecessary.
-        pass
+    # The MoE CLI uses worker processes. A single fixed rendezvous port makes
+    # concurrent workers race and, because the old implementation swallowed the
+    # exception, the later ReplicatedLinear constructor failed with the much less
+    # actionable "TP group is not initialized" error. Use a deterministic
+    # per-process port and fail at the bootstrap boundary with the real error.
+    if model_parallel_is_initialized():
+        return
+    port = 29599 + (os.getpid() % 1000)
+    with set_current_vllm_config(VllmConfig()):
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            local_rank=0,
+            distributed_init_method=f"tcp://127.0.0.1:{port}",
+        )
+        initialize_model_parallel(tensor_model_parallel_size=1)
 
 
 def uniform_topk(

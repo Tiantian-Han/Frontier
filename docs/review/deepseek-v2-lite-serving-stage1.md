@@ -8,7 +8,7 @@
 
 - 基线：上游 `NetX-lab/Frontier` `main` = `d71ad80b0800880808a0857fd30477e6d96592c6`
 - 分支：`review/deepseek-v2-lite-upstream`
-- 提交数：9（5 个功能提交 + 2 个测量修复 + 1 个文档提交 + 1 个 profile 重采提交）
+- 提交数：10（5 个功能提交 + 2 个测量修复 + 1 个文档提交 + 1 个 profile 重采提交 + 1 个 provenance/初始化修复提交）
 
 ---
 
@@ -44,8 +44,8 @@
    两个文件均为 777 行（259 个 token 点 × TP1/2/4）；`mlp_*` contract 明确绑定
    `dense_mlp_hidden_dim=10944`，shared expert 保留独立 contract。此前为兼容旧 CSV 加入的
    legacy 宽度放宽仍保留，但新 DeepSeek profile 已走上游 typed-contract 路径。
-2. **上游所有已入库的 MoE profile 都是 `vllm_fused`**（见第 2.3 节），因此第 2.3 节的修复会
-   改变所有 MoE 模型的分层时间——这是**精度修正**，不是回退，但属于行为变化，必须显式声明。
+2. **MoE 是否包含 assignment 现在由显式 provenance 字段决定**，不再从 `vllm_fused` backend 名称推断。
+   这样可以区分“fused API 内含 assignment”和“legacy producer 在计时前已完成 assignment”两种边界。
 
 ---
 
@@ -259,11 +259,11 @@ shim 缺陷。**
 | `.../attention_kernel_only.csv` | 同上形状的 kernel-only 家族，供 piecewise CUDA Graph 下的纯 decode 使用 |
 | `.../linear_op.csv` | 修复后重采：MLA 外部投影 + `o_proj` + dense FFN 10944 + shared expert 2816，vLLM 0.27.0 IR-native 路径，259 token 点、TP1/2/4，含 typed contracts |
 | `.../linear_op_kernel_only.csv` | 同上 kernel-only 家族；`attn_pre_proj` 是同一 forward 的 q/kv/norm 复合计时 |
-| `.../moe.csv` | vLLM 0.27 `fused_experts()` 生产内核，TP×EP 网格，uniform 路由 |
-| `.../moe_kernel_only.csv` | 同上 kernel-only 家族 |
+| `.../moe.csv` | vLLM 0.27 `fused_experts()` 生产内核，TP×EP 网格，uniform 路由；显式 assignment provenance |
+| `.../moe_kernel_only.csv` | 同上 kernel-only 家族；显式 assignment provenance |
 
-> 数据状态：这些 CSV 由**修复前**的 profiler 生成，`attn_pre_proj` 仍是「同名中位数」口径，
-> 且未包含 `kv_a_layernorm`。**必须重采**（见第 6 节）。重采时应保留真实服务的 IR-native RMSNorm 路径。
+> 数据状态：linear 与 MoE CSV 已使用修复后的 profiler 重采并替换。linear 两个文件各 777 行；
+> MoE 两个文件各 6993 行，并携带显式 `moe_grouped_gemm_includes_assignment=True`。
 
 ### 4.2 契约与导入
 
@@ -363,9 +363,11 @@ docker run --rm --gpus '"device=0"' ... ontos:vllm-0.27.0 \
 ## 6. 数据重采状态与命令
 
 `linear_op.csv` / `linear_op_kernel_only.csv` 已使用本次修复后的 profiler 重采并写回仓库。
-两个文件各 777 行（259 个 token 点 × TP1/2/4），并包含 `typed_operator_contracts`；其中
+两个文件各 777 行（259 个 token 点 × TP1/2/4），包含 `typed_operator_contracts`；其中
 `mlp_*` 明确绑定 `dense_mlp_hidden_dim=10944`，shared-expert contract 独立保留。
 重采保留真实 vLLM 的 IR-native RMSNorm 路径，`attn_pre_proj` 是同一 forward 三项之和。
+`moe.csv` / `moe_kernel_only.csv` 也已重采，各 6993 行，并包含显式
+`moe_grouped_gemm_includes_assignment=True`。
 
 重采网格（从现有 CSV 反推，共 259 个 token 点，与原数据逐点可比）：
 
@@ -404,9 +406,8 @@ docker run --rm --gpus '"device=0"' ... ontos:vllm-0.27.0 \
 
 ## 8. 遗留事项（按优先级）
 
-1. **P0｜重采 `linear_op.csv` / `linear_op_kernel_only.csv`**（第 6 节）已完成；两个文件均为 777 行，并含 typed contracts。重采应继续使用真实服务的 IR-native RMSNorm 路径。
-2. **P1｜确认 MoE 去重带来的既有基线变化**：第 2.3 节的修复会改变所有 `vllm_fused`
-   profile 的 MoE 分层时间，需要同步更新受影响的期望值/回归基线。
+1. **P0｜linear 与 MoE profile 重采已完成**：linear 各 777 行、MoE 各 6993 行；均已完成 schema、typed contract 和 provenance 校验。
+2. **P1｜更新 MoE 去重后的既有基线**：去重逻辑现由显式 provenance 控制；需要重新跑完整 Frontier smoke/formal，确认仿真结果与旧基线的变化。
 3. **P2｜`_ffn_construction_dim` 已删除**，`profiling_plan.py` 完全交由上游 typed contract 驱动。
 4. **P2｜继续做真实 CUDA Graph replay profile**：当前 kernel-only 是 IR-native device-time
    profile；若要建模 graph replay 调度开销，需要独立 graph-mode 采集。

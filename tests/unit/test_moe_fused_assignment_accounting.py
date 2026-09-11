@@ -47,14 +47,34 @@ def _predictor(moe_input_file: Path | None) -> _Predictor:
     return predictor
 
 
-def _write_moe_csv(path: Path, backend_values: list[str]) -> Path:
-    rows = "\n".join(backend_values)
-    path.write_text(f"moe_grouped_gemm_backend\n{rows}\n", encoding="utf-8")
+def _write_moe_csv(
+    path: Path,
+    backend_values: list[str],
+    assignment_values: list[str] | None = None,
+) -> Path:
+    if assignment_values is None:
+        assignment_values = ["false"] * len(backend_values)
+    assert len(assignment_values) == len(backend_values)
+    rows = "\n".join(
+        f"{backend},{includes}"
+        for backend, includes in zip(backend_values, assignment_values)
+    )
+    path.write_text(
+        "moe_grouped_gemm_backend,moe_grouped_gemm_includes_assignment\n"
+        f"{rows}\n",
+        encoding="utf-8",
+    )
     return path
 
 
-def test_fused_runtime_kernel_is_detected_as_including_assignment(tmp_path: Path) -> None:
-    moe_csv = _write_moe_csv(tmp_path / "fused.csv", ["vllm_fused", "vllm_fused"])
+def test_fused_runtime_kernel_requires_explicit_assignment_provenance(
+    tmp_path: Path,
+) -> None:
+    moe_csv = _write_moe_csv(
+        tmp_path / "fused.csv",
+        ["vllm_fused", "vllm_fused"],
+        ["true", "true"],
+    )
 
     predictor = _predictor(moe_csv)
 
@@ -64,7 +84,7 @@ def test_fused_runtime_kernel_is_detected_as_including_assignment(tmp_path: Path
 def test_fused_runtime_kernel_suppresses_the_separate_shuffling_term(
     tmp_path: Path,
 ) -> None:
-    moe_csv = _write_moe_csv(tmp_path / "fused.csv", ["vllm_fused"])
+    moe_csv = _write_moe_csv(tmp_path / "fused.csv", ["vllm_fused"], ["true"])
 
     predictor = _predictor(moe_csv)
 
@@ -87,7 +107,9 @@ def test_legacy_profile_without_provenance_keeps_the_separate_term(
 ) -> None:
     legacy_csv = tmp_path / "legacy.csv"
     legacy_csv.write_text(
-        "num_tokens,time_stats.moe_shuffling.median\n32,0.5\n", encoding="utf-8"
+        "num_tokens,time_stats.moe_shuffling.median,moe_grouped_gemm_backend\n"
+        "32,0.5,vllm_fused\n",
+        encoding="utf-8",
     )
 
     predictor = _predictor(legacy_csv)
@@ -105,7 +127,7 @@ def test_missing_moe_profile_keeps_the_separate_term() -> None:
 
 
 def test_provenance_is_resolved_once_per_predictor(tmp_path: Path) -> None:
-    moe_csv = _write_moe_csv(tmp_path / "fused.csv", ["vllm_fused"])
+    moe_csv = _write_moe_csv(tmp_path / "fused.csv", ["vllm_fused"], ["true"])
     predictor = _predictor(moe_csv)
 
     assert predictor._moe_grouped_gemm_includes_assignment() is True

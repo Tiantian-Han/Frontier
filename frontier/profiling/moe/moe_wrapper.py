@@ -580,6 +580,7 @@ class MoEWrapper:
         profiling_global_num_experts = routing_inputs["global_num_experts"]
         profiling_expert_map = routing_inputs["expert_map"]
 
+        grouped_gemm_includes_assignment = False
         if self.use_vllm_kernel:
             time_stats = self._profile_with_vllm_kernel(
                 num_tokens=num_tokens,
@@ -589,6 +590,13 @@ class MoEWrapper:
                 expert_map=profiling_expert_map,
             )
             grouped_gemm_backend = "vllm_fused"
+            # Only the vLLM >= 0.27 functional fused_experts path includes
+            # _prepare_expert_assignment inside the timed region. The legacy
+            # path and FP8 path time an already-prepared grouped GEMM.
+            from frontier.profiling.moe.moe_vllm_kernel import VLLM_API_VERSION
+            grouped_gemm_includes_assignment = (
+                VLLM_API_VERSION == "0.27.x" and not self.use_fp8
+            )
         else:
             time_stats = self._profile_with_loop(
                 expert_token_counts=expert_token_counts,
@@ -613,6 +621,9 @@ class MoEWrapper:
             **load_input.to_features_dict(),
             "num_tensor_parallel_workers": self.num_tensor_parallel_workers,
             "moe_grouped_gemm_backend": grouped_gemm_backend,
+            "moe_grouped_gemm_includes_assignment": bool(
+                grouped_gemm_includes_assignment
+            ),
         }
 
         return stats
@@ -725,6 +736,7 @@ class MoEWrapper:
         time_stats: Mapping[str, object],
         *,
         num_tokens: int,
+        grouped_gemm_includes_assignment: bool = False,
     ) -> dict:
         """Build one MoE row and attach metadata for measured routed operators."""
 
@@ -746,6 +758,12 @@ class MoEWrapper:
             "expert_hidden_dim": self.expert_hidden_dim,
             "use_gated": self.use_gated,
             "num_tensor_parallel_workers": self.num_tensor_parallel_workers,
+            # This is explicit measurement-boundary provenance. A backend name
+            # alone is not sufficient because legacy producers may perform
+            # assignment before entering their timed region.
+            "moe_grouped_gemm_includes_assignment": bool(
+                grouped_gemm_includes_assignment
+            ),
         }
 
         measured_names = set(time_stats)
@@ -828,8 +846,16 @@ class MoEWrapper:
         combined_time_stats.update(grouped_gemm_stats["time_stats"])
 
         # Combine all stats (including load imbalance features from grouped_gemm_stats)
-        stats = self._build_profile_result(combined_time_stats, num_tokens=num_tokens)
-        
+        stats = self._build_profile_result(
+            combined_time_stats,
+            num_tokens=num_tokens,
+            grouped_gemm_includes_assignment=bool(
+                grouped_gemm_stats.get(
+                    "moe_grouped_gemm_includes_assignment", False
+                )
+            ),
+        )
+
         # Add load imbalance features from grouped_gemm_stats (if present)
         # These are added by profile_grouped_gemm when load imbalance is enabled
         for key in grouped_gemm_stats:
