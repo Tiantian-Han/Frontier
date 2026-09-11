@@ -173,7 +173,7 @@ Step2Mini-tiny                       : vllm_fused
 step-moe-noquant-small               : vllm_fused
 ```
 
-**修复方式**（预测器侧，无需重采数据）：
+**修复方式**（预测器侧，并通过重采后的显式 provenance 验证）：
 
 - 新增 `_moe_grouped_gemm_includes_assignment()`：读取 MoE profile 的
   `moe_grouped_gemm_backend` 列，当包含 `vllm_fused` 时判定 grouped-GEMM 项已内含对齐步骤；
@@ -279,7 +279,7 @@ shim 缺陷。**
 | 文件 | 原因 |
 |---|---|
 | `frontier/config/model_config.py` | 当无显式 `share_expert_dim` / `shared_expert_intermediate_size` 时，由 `n_shared_experts × moe_intermediate_size` 推断 shared expert 宽度（DeepSeek 把 2 个 shared expert 融合为一个 2816 的 FFN）。注：本文件中的 `dense_mlp_hidden_dim` / `routed_mlp_hidden_dim` 是**上游的**，我们的重复赋值已在对账中删除 |
-| `frontier/execution_time_predictor/sklearn_execution_time_predictor.py` | ① MLA 外部投影计入 `_predict_mla_attention_layer_time`（见 4.4）；② legacy 非 typed 宽度过滤放宽为 `{mlp_hidden_dim} ∪ {dense_mlp_hidden_dim}`；③ 训练期对 `mlp_up_proj`/`mlp_act`/`mlp_down_proj` 仅取 dense 宽度行，避免 dense 模型学到专家形状数据 |
+| `frontier/execution_time_predictor/sklearn_execution_time_predictor.py` | ① MLA 外部投影计入 `_predict_mla_attention_layer_time`（见 4.4）；② legacy CSV 保留宽度兼容路径；③ typed CSV 由 `typed_operator_contracts` 选择 10944 dense 行，不再进行会误删 dense 行的顶层二次过滤 |
 | `frontier/execution_time_predictor/sklearn_moe_execution_time_predictor.py` | ① DeepSeek 家族（`deepseek_v2`/`deepseek_v3`/`deepseek_mtp`）的 dense 层改走真实 `mlp_*` 模型，而非 Step2Mini/Step3 的 shared-expert 映射（后者会把 10944 错记为 2816）；② **本次新增**：`_moe_grouped_gemm_includes_assignment()` + `_get_moe_shuffling_time()` 去重（见 2.3） |
 
 ### 4.4 MLA 外部投影（本次两处修复所在）
@@ -315,7 +315,7 @@ shim 缺陷。**
 | 文件 | 原因 |
 |---|---|
 | `tests/unit/test_deepseek_mla_linear_op_accounting.py`（**新增**） | 守卫：子算子计时名互不相同、复合计时器持有规范名且未被禁用、`kv_a_layernorm` 存在且宽度为 `kv_lora_rank`、norm 不单独计时、builder 的路径选择与 `q_lora_rank` 拒绝逻辑 |
-| `tests/unit/test_moe_fused_assignment_accounting.py`（**新增**） | 守卫：`vllm_fused` 判定、shuffling 抑制、`frontier_loop`/legacy/缺失 profile 保持原行为、provenance 只解析一次 |
+| `tests/unit/test_moe_fused_assignment_accounting.py`（**新增**） | 守卫：显式 provenance=true 才抑制 shuffling；仅有 `vllm_fused` 名称、`frontier_loop`、legacy/缺失 profile 均不推断边界；provenance 只解析一次 |
 | `mla_h800_fixture.py`、`test_attention_family_spec_data.py`、`test_mla_predictor_*`、`test_mla_vllm_profile_importer.py` | 家族契约由「固定 128 q head、单一 backend」变为「目标派生」，相应夹具与断言更新；`test_attention_family_spec_data.py` 现在显式断言契约为 `None`/`None` |
 
 ---
@@ -404,13 +404,18 @@ docker run --rm --gpus '"device=0"' ... ontos:vllm-0.27.0 \
 
 ---
 
-## 8. 遗留事项（按优先级）
+## 8. Smoke 与遗留事项（按优先级）
+
+### 8.1 六格 non-dummy smoke：已通过
+
+使用新 profile、typed contracts、显式 assignment provenance 和 `piecewise` decode graph selector，TP1/TP2/TP4 × QPS1/32 六格全部通过：每格 100/100 请求、exit code 0。OP-TRACE 审计确认 layer 0 为 Dense、后续层为 MoE，CUDA-graph activation 记录 14,134 条，fused provenance 下 `moe_shuffling` 被抑制。
 
 1. **P0｜linear 与 MoE profile 重采已完成**：linear 各 777 行、MoE 各 6993 行；均已完成 schema、typed contract 和 provenance 校验。
-2. **P1｜更新 MoE 去重后的既有基线**：去重逻辑现由显式 provenance 控制；需要重新跑完整 Frontier smoke/formal，确认仿真结果与旧基线的变化。
+2. **P1｜更新 MoE 去重后的既有基线**：去重逻辑现由显式 provenance 控制；六格 smoke 已通过，仍需要重新跑完整 Frontier formal，确认仿真结果与旧基线的变化。
 3. **P2｜`_ffn_construction_dim` 已删除**，`profiling_plan.py` 完全交由上游 typed contract 驱动。
 4. **P2｜继续做真实 CUDA Graph replay profile**：当前 kernel-only 是 IR-native device-time
    profile；若要建模 graph replay 调度开销，需要独立 graph-mode 采集。
+5. **P2｜Smoke harness**：`tests/analysis/deepseek_v2_lite/run_stage1_smoke.py` 会保存 commit、profile hash、每格命令、trace hash、完成行数和 exit code，避免超时运行被误报为通过。
 
 ---
 
