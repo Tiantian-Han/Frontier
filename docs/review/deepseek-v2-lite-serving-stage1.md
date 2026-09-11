@@ -89,7 +89,7 @@ kernel-only 家族（`--profile_method record_function`）：
 | 1024 | 0.04752 | 0.01933 | 0.00782 | 0.02715 | 0.02037 |
 
 即 `attn_pre_proj` 现在**确实等于** `q_proj + kv_a_proj + kv_a_layernorm`。
-残差的量级与第 3 节发现的 shim 膨胀一致（见 3.1）。
+残差的量级与第 3 节复核的 vLLM IR-native RMSNorm 成本一致（见 3.1）。
 
 **必须并存的注意事项（CUDA_EVENT 家族）**：同一探测在 `--profile_method cuda_event` 下
 @1 token 得到 `attn_pre_proj = 0.24749 ms`，而 `q_proj + kv_a_proj = 0.05667 ms`，
@@ -188,48 +188,65 @@ step-moe-noquant-small               : vllm_fused
 
 ---
 
-## 3. 修复过程中新发现的缺陷（高严重度，**未修**，需批准）
+## 3. RMSNorm 路径复核：此前的“shim 缺陷”判断已撤销
 
-### 3.1 缺陷四：Frontier 的 RMSNorm shim 测出的 device 时间比 vLLM 原生算子高约 7–10 倍
+### 3.1 第一次判断为什么看起来像缺陷
 
-**发现过程**：修完问题一/二后，用 kernel-only 模式验证 `attn_pre_proj` 的残差。理论上残差
-应等于 512 宽 RMSNorm 的内核时间（数微秒），实测却是 12.7–20.4 µs。于是用同一套
-`RecordFunctionTracer` 做了独立对照实验（10.96.11.9 / GPU0）：
+第一次对照时，将 Frontier shim 的结果与 `vllm._custom_ops.rms_norm`（融合 C kernel）比较：
 
-| num_tokens | Frontier `RMSNorm` shim | vLLM 原生 `ops.rms_norm` | shim 多报 |
+| num_tokens | Frontier shim 初测 | `_custom_ops.rms_norm` 初测 |
+|---:|---:|---:|
+| 1 | 11.87 µs | 1.70 µs |
+| 1024 | 18.56 µs | 2.46 µs |
+
+表面上像是 shim 多报 7–10 倍，因此一度将其列为 HIGH 缺陷。
+
+### 3.2 最终核查：两者不是同一条 runtime 路径
+
+阅读 vLLM 0.27.0 源码后确认，`RMSNorm.forward_native()` 调的是 `ir.ops.rms_norm`，而不是
+`_custom_ops.rms_norm`。IR native 实现是组合式 PyTorch 操作，包括 float32 cast、平方、
+mean reduction、rsqrt、乘法和 dtype cast。
+
+真实服务日志明确记录：
+
+```text
+Final IR op priority ... rms_norm=['native'], fused_add_rms_norm=['native']
+```
+
+Frontier shim 的调用链为：
+
+```text
+Frontier RMSNorm
+  -> _VllmRmsNormShim
+       -> VllmRMSNormClass.forward
+            -> forward_native
+                 -> ir.ops.rms_norm
+```
+
+重新用同一套 `RecordFunctionTracer` 对 Frontier shim、vLLM IR native、融合 C kernel 做闭环验证：
+
+| tokens | Frontier shim | vLLM IR native | 融合 C kernel |
 |---:|---:|---:|---:|
-| 1 | 11.87 µs | 1.70 µs | **+10.17 µs** |
-| 64 | 14.30 µs | 1.76 µs | **+12.54 µs** |
-| 1024 | 18.56 µs | 2.46 µs | **+16.10 µs** |
+| 1 | 11.81 µs | 11.87 µs | 1.70 µs |
+| 1024 | 17.66 µs | 18.24 µs | 2.50 µs |
 
-并且已验证**不是** `hidden_size` 造成的（`VllmRMSNormClass(1)` 与 `VllmRMSNormClass(512)`
-结果相同，分别 11.87 / 11.87 µs @1 token，18.34 / 18.45 µs @1024 token），
-即多报来自 `torch.ops.vllm.rms_norm` CustomOp 派发路径本身。
+**最终结论：Frontier shim 与真实 vLLM 的 IR native 路径一致，差异约 0.1–0.6 µs，不是
+shim 缺陷。**
 
-**根因位置**：`frontier/profiling/common/layers/layernorm.py` 的 `_VllmRmsNormShim`。
-它构造 `VllmRMSNormClass(1, eps=1e-6)` 并在每次调用时 `object.__setattr__` 绑定 weight，
-再走 `self._op(x)`（即 CustomOp）。真实 vLLM 在该容器里 `rms_norm` 的优先级是 `native`，
-实际走的是 `forward_native → ops.rms_norm`。shim 绕了一层 CustomOp 派发，导致
-被计入 span 的 device 时间显著膨胀。
+此前的“shim 多报 10–16 µs”结论是误诊，原因是把真实服务没有使用的融合 C kernel 当成了
+对照基线。修复后的 `attn_pre_proj` 残差与 IR-native RMSNorm 的独立测量相符，证明
+`kv_a_layernorm` 已经被正确执行并计入复合时间。
 
-**影响范围（跨模型、既有）**：
-`input_layernorm`、`post_attention_layernorm`、`attn_inter_norm`、以及本次新增的
-`kv_a_layernorm` 等**所有经该 shim 测量的 norm 项**都被高估约 10–16 µs/次。
-由于每层都有 2 个 norm，27 层、128 token 的 decode 会累积到毫秒量级。
+### 3.3 对部署性能的真实含义
 
-**为什么本次不修**：
-- 该 shim 被**所有模型**的 linear-op / MoE profiling 使用；
-- 修它相当于改变全部既有 profile 的 norm 数值，按仓库开发准则必须有「显式批准的
-  fidelity fix」；
-- 修完还必须**重采全部既有 CSV**，否则新旧数据不可比。
+这是一条真实的 vLLM runtime 选择，而不是 Frontier 的测量错误：
 
-**建议修复方式**（待批准）：让 shim 在可用时直接调用与真实 vLLM 相同的原生算子
-（`ops.rms_norm` / `ops.fused_add_rms_norm`），而不是经 CustomOp；随后重采受影响的
-`linear_op.csv` 家族。
+- 当前镜像的真实服务使用 IR native 组合式 RMSNorm；
+- 融合 C kernel 更快，但当前服务没有选择它；
+- 若要优化服务，应单独研究如何安全启用融合 RMSNorm，以及其对数值、CUDA Graph、
+  batch invariance 和模型输出的影响；不能在 Frontier profile 中擅自替换 runtime 语义。
 
-**当前后果声明**：本分支重采后的 `attn_pre_proj` 在结构上已正确（= q + kv_a + norm 的求和），
-但其中 norm 分量目前被上述缺陷放大约 10–16 µs。在缺陷修复并重采之前，
-**`attn_pre_proj` 的绝对值不可用于跨实现对比**。
+因此 `layernorm.py` 的 shim 保持不变，本节不再列为待修复缺陷。
 
 ---
 
@@ -248,7 +265,7 @@ step-moe-noquant-small               : vllm_fused
 | `.../moe_kernel_only.csv` | 同上 kernel-only 家族 |
 
 > 数据状态：这些 CSV 由**修复前**的 profiler 生成，`attn_pre_proj` 仍是「同名中位数」口径，
-> 且未包含 `kv_a_layernorm`。**必须重采**（见第 6 节）。
+> 且未包含 `kv_a_layernorm`。**必须重采**（见第 6 节）。重采时应保留真实服务的 IR-native RMSNorm 路径。
 
 ### 4.2 契约与导入
 
@@ -320,7 +337,7 @@ step-moe-noquant-small               : vllm_fused
 
 MoE 相关集合 `test_moe_*.py + test_typed_ep_*.py`：`422 passed, 6 failed`。
 
-**唯一/全部失败项均在上游 `main`（`d71ad80`）的干净 worktree 中复现同样失败**，
+**全部失败项均在上游 `main`（`d71ad80`）的干净 worktree 中复现同样失败**，
 属既有问题，**非本分支回归**：
 
 - `test_mla_stage3_online_trace_builder.py::test_mla_stage3_cli_writes_trace_and_error_matrix`
@@ -341,15 +358,15 @@ docker run --rm --gpus '"device=0"' ... ontos:vllm-0.27.0 \
 
 1. `attn_pre_proj` 已等于 `q_proj + kv_a_proj + kv_a_layernorm`（结构正确 ✅）；
 2. `kv_a_layernorm` 确实执行（残差非零且随 token 增长 ✅）；
-3. 但 norm 分量被 shim 放大约 7–10 倍（❌，见第 3 节）。
+3. norm 分量与 vLLM IR-native runtime 一致；此前与融合 C kernel 的差异是 runtime 路径差异，不是 shim 膨胀。
 
 ---
 
 ## 6. 数据重采状态与命令
 
 `linear_op.csv` / `linear_op_kernel_only.csv` 目前仍是**修复前**口径（同名中位数、无
-`kv_a_layernorm`），**必须重采**。但建议**在第 3 节 shim 缺陷修复之后再执行**，
-否则会把已知偏差固化进数据。
+`kv_a_layernorm`），**必须重采**。重采应直接使用本次已修复的 profiler，并保留真实 vLLM 的
+IR-native RMSNorm 路径，确保新 profile 的 `attn_pre_proj` 是单次 forward 三项之和。
 
 重采网格（从现有 CSV 反推，共 259 个 token 点，与原数据逐点可比）：
 
@@ -388,13 +405,11 @@ docker run --rm --gpus '"device=0"' ... ontos:vllm-0.27.0 \
 
 ## 8. 遗留事项（按优先级）
 
-1. **P0｜修复 RMSNorm shim 的 CustomOp 派发膨胀**（第 3 节），随后重采全部受影响 CSV。
-   这是当前 `attn_pre_proj` 绝对精度不可用的直接原因。
-2. **P0｜重采 `linear_op.csv` / `linear_op_kernel_only.csv`**（第 6 节），使数据与已修
-   的 profiler 口径一致。
-3. **P1｜迁移到 typed operator contract**：让 DeepSeek 的 `linear_op.csv` 携带
+1. **P0｜重采 `linear_op.csv` / `linear_op_kernel_only.csv`**（第 6 节），使数据与已修
+   的 profiler 口径一致。重采应继续使用真实服务的 IR-native RMSNorm 路径。
+2. **P1｜迁移到 typed operator contract**：让 DeepSeek 的 `linear_op.csv` 携带
    `typed_operator_contracts` 列，从而删除本分支对 legacy 宽度过滤的放宽。
-4. **P1｜确认 MoE 去重带来的既有基线变化**：第 2.3 节的修复会改变所有 `vllm_fused`
+3. **P1｜确认 MoE 去重带来的既有基线变化**：第 2.3 节的修复会改变所有 `vllm_fused`
    profile 的 MoE 分层时间，需要同步更新受影响的期望值/回归基线。
 5. **P2｜`_ffn_construction_dim` 已删除**，`profiling_plan.py` 完全交由上游 typed contract 驱动。
 
